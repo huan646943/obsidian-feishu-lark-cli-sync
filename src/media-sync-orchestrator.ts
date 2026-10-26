@@ -20,7 +20,7 @@ export interface MediaSyncHost {
 
 type PlaceholderLocation =
 	| { mode: "standalone"; blockId: string; startIndex: number; endIndex: number }
-	| { mode: "embedded-checkbox"; blockId: string; startIndex: number; endIndex: number };
+	| { mode: "embedded"; blockId: string; startIndex: number; endIndex: number };
 
 export async function materializeLocalImages(
 	images: LocalImageResource[],
@@ -31,10 +31,11 @@ export async function materializeLocalImages(
 	}
 
 	let snapshot = await host.fetchRemoteWithIds();
-	for (const image of images) {
+	// Insert backwards so multiple images anchored to one text block retain their order.
+	for (const image of [...images].reverse()) {
 		const location = findPlaceholderLocation(snapshot.content, image.placeholder);
 		if (!location) {
-			continue;
+			throw new Error(`找不到图片占位符：${image.vaultPath}`);
 		}
 
 		// selection-with-ellipsis 会让飞书重建整篇文档的 block。先追加再移动，只影响新增图片和锚点。
@@ -75,11 +76,13 @@ export function buildMediaInsertArgs(
 		"--type",
 		"image"
 	];
-	if (image.displayWidth) {
-		args.push("--width", String(image.displayWidth));
+	const width = image.displayWidth || image.sourceWidth;
+	const height = image.displayHeight || image.sourceHeight;
+	if (width) {
+		args.push("--width", String(width));
 	}
-	if (image.displayHeight) {
-		args.push("--height", String(image.displayHeight));
+	if (height) {
+		args.push("--height", String(height));
 	}
 	if (image.alt) {
 		args.push("--caption", image.alt);
@@ -113,7 +116,7 @@ export function buildPlaceholderRemoveArgs(
 }
 
 function findPlaceholderLocation(remoteXml: string, placeholder: string): PlaceholderLocation | null {
-	return findPlaceholderBlock(remoteXml, placeholder) || findEmbeddedCheckbox(remoteXml, placeholder);
+	return findPlaceholderBlock(remoteXml, placeholder) || findEmbeddedPlaceholder(remoteXml, placeholder);
 }
 
 function findPlaceholderBlock(
@@ -135,24 +138,26 @@ function findPlaceholderBlock(
 	} : null;
 }
 
-function findEmbeddedCheckbox(
+function findEmbeddedPlaceholder(
 	remoteXml: string,
 	placeholder: string
-): Extract<PlaceholderLocation, { mode: "embedded-checkbox" }> | null {
+): Extract<PlaceholderLocation, { mode: "embedded" }> | null {
 	const escapedPlaceholder = escapeRegExp(placeholder);
-	const checkboxContent = `(?:(?!<\\/checkbox>)[\\s\\S])*?${escapedPlaceholder}`
-		+ "(?:(?!<\\/checkbox>)[\\s\\S])*?";
-	const pattern = new RegExp(`<checkbox\\b([^>]*)>${checkboxContent}<\\/checkbox>`, "i");
+	// Do not match a parent list item across nested text blocks.
+	const textContent = "(?:(?!<\\/?(?:p|li|checkbox)\\b)[\\s\\S])*?";
+	const pattern = new RegExp(
+		`<(p|li|checkbox)\\b([^>]*)>${textContent}${escapedPlaceholder}${textContent}</\\1>`, "i"
+	);
 	const match = pattern.exec(remoteXml);
 	if (!match || match.index === undefined) {
 		return null;
 	}
-	const blockId = readBlockId(match[1] || "");
+	const blockId = readBlockId(match[2] || "");
 	if (!blockId) {
 		return null;
 	}
 	return {
-		mode: "embedded-checkbox",
+		mode: "embedded",
 		blockId,
 		startIndex: match.index,
 		endIndex: match.index + match[0].length
@@ -164,7 +169,7 @@ function hasImageAfter(
 	location: PlaceholderLocation,
 	blockId: string
 ): boolean {
-	const adjacentContent = remoteXml.slice(location.endIndex).trimStart();
+	const adjacentContent = remoteXml.slice(location.endIndex).replace(/^(?:\s*<\/(?:ol|ul|li)>)*\s*/, "");
 	const escapedBlockId = escapeRegExp(blockId);
 	return new RegExp(`^<img\\b[^>]*\\bid=["']${escapedBlockId}["'][^>]*(?:\\/>|>[\\s\\S]*?<\\/img>)`, "i")
 		.test(adjacentContent);

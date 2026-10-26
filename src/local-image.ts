@@ -358,6 +358,12 @@ function replaceImageReferences(
 		const nextLineBreak = content.indexOf("\n", reference.end);
 		const lineEnd = nextLineBreak < 0 ? content.length : nextLineBreak;
 		const prefix = content.slice(lineStart, reference.start).trim();
+		// Keep inline images in their text/list block instead of breaking list indentation.
+		if (prefix) {
+			result += image.placeholder;
+			cursor = reference.end;
+			continue;
+		}
 		const suffix = content.slice(reference.end, lineEnd).trim();
 		const previousLineStart = lineStart > 0 ? content.lastIndexOf("\n", lineStart - 2) + 1 : 0;
 		const previousLine = lineStart > 0 ? content.slice(previousLineStart, lineStart - 1).trim() : "";

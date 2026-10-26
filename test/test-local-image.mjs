@@ -160,9 +160,9 @@ try {
 			revisionId += 1;
 		}
 	});
-	assert.deepEqual(inserted, [firstImage.placeholder, secondImage.placeholder]);
-	assert.deepEqual(moved, [["image-1", "first"], ["image-2", "second"]]);
-	assert.deepEqual(deleted, ["first", "second"]);
+	assert.deepEqual(inserted, [secondImage.placeholder, firstImage.placeholder]);
+	assert.deepEqual(moved, [["image-1", "second"], ["image-2", "first"]]);
+	assert.deepEqual(deleted, ["second", "first"]);
 	assert.doesNotMatch(snapshot.content, /FEISHU_LARK_LOCAL_IMAGE_/);
 
 	let embeddedRemoteXml = `<checkbox id="task">验收交互<br/>${firstImage.placeholder}</checkbox><p id="next">下一项</p>`;
@@ -197,6 +197,52 @@ try {
 	assert.deepEqual(removedPlaceholders, [firstImage.placeholder]);
 	assert.match(embeddedSnapshot.content, /<checkbox id="task">验收交互<br\/><\/checkbox><img id="embedded-image"\/>/);
 	assert.doesNotMatch(embeddedSnapshot.content, /FEISHU_LARK_LOCAL_IMAGE_/);
+
+	const nestedMarkdown = "1. Parent\n    1. Child![[root.png]]\n    2. Next\n2. End";
+	const nestedPrepared = await prepareLocalImages({
+		vaultRoot: workspace, markdownPath: "notes/note.md", content: nestedMarkdown
+	});
+	assert.equal(nestedPrepared.content, nestedMarkdown.replace("![[root.png]]", nestedPrepared.images[0].placeholder));
+	for (const tag of ["p", "li", "checkbox"]) {
+		// Two images in one leaf block, with a parent li that must not become the anchor.
+		let xml = `<ol><li id="parent">Parent<ol><${tag} id="leaf">Text${firstImage.placeholder}${secondImage.placeholder}</${tag}></ol></li></ol>`;
+		let uploads = 0;
+		const result = await materializeLocalImages([firstImage, secondImage], {
+			async fetchRemoteWithIds() { return { content: xml }; },
+			async insertImage() { return { blockId: `inserted-${++uploads}` }; },
+			async moveBlockAfter(blockId, targetBlockId) {
+				assert.equal(targetBlockId, "leaf");
+				xml = xml.replace(`</${tag}>`, `</${tag}><img id="${blockId}"/>`);
+			},
+			async removePlaceholder(placeholder) { xml = xml.replace(placeholder, ""); },
+			async deleteBlock() { assert.fail("Must preserve embedded text"); }
+		});
+		assert.match(result.content, /Text/);
+		assert.doesNotMatch(result.content, /FEISHU_LARK_LOCAL_IMAGE_/);
+		assert.match(result.content, /<img id="inserted-2"\/><img id="inserted-1"\/>/);
+	}
+	await assert.rejects(materializeLocalImages([firstImage], {
+		async fetchRemoteWithIds() { return { content: '<p id="other">Missing</p>' }; },
+		async insertImage() { assert.fail("Must fail before uploading"); }
+	}), /找不到图片占位符/);
+
+	// WebP dimensions must be explicit: CLI fallback can create a 100x100 block.
+	const webp = Buffer.alloc(30);
+	webp.write("RIFF", 0); webp.write("WEBP", 8); webp.write("VP8X", 12);
+	webp.writeUIntLE(2381, 24, 3); webp.writeUIntLE(323, 27, 3);
+	await writeFile(join(workspace, "wide.webp"), webp);
+	const wide = await prepareLocalImages({
+		vaultRoot: workspace, markdownPath: "notes/note.md", content: "![[wide.webp]]"
+	});
+	const nativeArgs = buildMediaInsertArgs("doc-token", wide.images[0]);
+	assert.equal(nativeArgs[nativeArgs.indexOf("--width") + 1], "2382");
+	assert.equal(nativeArgs[nativeArgs.indexOf("--height") + 1], "324");
+	const resized = await prepareLocalImages({
+		vaultRoot: workspace, markdownPath: "notes/note.md", content: "![[wide.webp|600x200]]"
+	});
+	const resizedArgs = buildMediaInsertArgs("doc-token", resized.images[0]);
+	assert.equal(resizedArgs[resizedArgs.indexOf("--width") + 1], "600");
+	assert.equal(resizedArgs[resizedArgs.indexOf("--height") + 1], "200");
 
 	const mediaArgs = buildMediaInsertArgs("doc-token", firstImage);
 	assert.deepEqual(mediaArgs.slice(0, 2), ["docs", "+media-insert"]);
