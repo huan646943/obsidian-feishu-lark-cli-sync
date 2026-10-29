@@ -143,6 +143,7 @@ const STAGED_PUBLISH_THRESHOLD_UNITS = 400;
 const STAGED_PUBLISH_MAX_BATCH_BYTES = 60 * 1024;
 const STAGED_PUBLISH_MAX_BATCH_UNITS = 100;
 const DOCUMENT_END_BLOCK_ID = "-1";
+const LARK_WIKI_NODE_DELETED_CODE = 131012;
 
 type Language = "zh-CN" | "en";
 type AutoSyncMode = "manual" | "save" | "pre-push";
@@ -221,6 +222,7 @@ interface LarkCommandResult {
 		};
 	};
 	error?: {
+		code?: number;
 		message?: string;
 		hint?: string;
 	};
@@ -2933,15 +2935,27 @@ exec "${nodePath}" "${scriptPath}" "$@"
 			const existingBinding = this.settings.folderBindings[bindingKey];
 
 			if (existingBinding?.token) {
-				parent = {
+				const cachedParent: RemoteParent = {
 					token: existingBinding.token,
 					kind: existingBinding.containerKind || parent.kind
 				};
-				continue;
+				if (await this.isCachedRemoteFolderAvailable(cachedParent)) {
+					parent = cachedParent;
+					continue;
+				}
+
+				// A deleted ancestor invalidates all cached descendants, but not siblings.
+				for (const key of Object.keys(this.settings.folderBindings)) {
+					if (key === bindingKey || key.startsWith(`${bindingKey}/`)) {
+						delete this.settings.folderBindings[key];
+					}
+				}
+				await this.saveSettingsWithoutClearingCommandCache();
 			}
 
 			const folderBinding = await this.createRemoteFolderPage(segments[index] || "Untitled", parent);
 			this.settings.folderBindings[bindingKey] = folderBinding;
+			await this.saveSettingsWithoutClearingCommandCache();
 			createdBinding = true;
 			parent = {
 				token: folderBinding.token,
@@ -2953,6 +2967,21 @@ exec "${nodePath}" "${scriptPath}" "$@"
 			parent,
 			createdBinding
 		};
+	}
+
+	private async isCachedRemoteFolderAvailable(parent: RemoteParent): Promise<boolean> {
+		if (parent.kind !== "wiki" && parent.kind !== "my_library") {
+			return true;
+		}
+		try {
+			await this.runLarkCli(["wiki", "+node-get", "--as", "user", "--node-token", parent.token, "--json"]);
+			return true;
+		} catch (error) {
+			if (this.readLarkErrorCode(error) !== LARK_WIKI_NODE_DELETED_CODE) {
+				throw error;
+			}
+			return false;
+		}
 	}
 
 	private async createRemoteFolderPage(name: string, parent: RemoteParent): Promise<BoundLarkDocument> {
@@ -3145,7 +3174,9 @@ exec "${nodePath}" "${scriptPath}" "$@"
 		try {
 			return await this.runLarkCliWithRetry(args, options);
 		} catch (error) {
-			throw new Error(this.formatCommandError(error));
+			throw Object.assign(new Error(this.formatCommandError(error)), {
+				larkCode: this.readLarkErrorCode(error)
+			});
 		} finally {
 			this.larkCliActiveRequestCount = Math.max(0, this.larkCliActiveRequestCount - 1);
 		}
@@ -3195,7 +3226,7 @@ exec "${nodePath}" "${scriptPath}" "$@"
 		const result = this.parseLarkCommandResult(stdout);
 
 		if (!result.ok) {
-			throw new Error(this.formatLarkError(result));
+			throw Object.assign(new Error(this.formatLarkError(result)), { larkCode: result.error?.code });
 		}
 
 		return result;
@@ -3305,6 +3336,24 @@ exec "${nodePath}" "${scriptPath}" "$@"
 			|| normalizedMessage.includes("frequency limit")
 			|| normalizedMessage.includes("rate limit")
 			|| normalizedMessage.includes("too many requests");
+	}
+
+	private readLarkErrorCode(error: unknown): number | undefined {
+		if (this.isRecord(error) && typeof error.larkCode === "number") {
+			return error.larkCode;
+		}
+		const outputs = [
+			this.hasCommandStderr(error) ? this.commandOutputToString(error.stderr) : "",
+			this.hasCommandStdout(error) ? this.commandOutputToString(error.stdout) : ""
+		];
+		for (const output of outputs) {
+			const result = this.tryParseLarkCommandResult(output)
+				|| this.tryParseLarkCommandResult(this.extractEmbeddedJson(output) || "");
+			if (result?.ok === false && typeof result.error?.code === "number") {
+				return result.error.code;
+			}
+		}
+		return undefined;
 	}
 
 	private formatLarkError(result: LarkCommandResult): string {
@@ -3422,6 +3471,7 @@ exec "${nodePath}" "${scriptPath}" "$@"
 
 	private isLarkCommandError(value: unknown): value is LarkCommandResult["error"] {
 		return this.isRecord(value)
+			&& this.isOptionalNumber(value.code)
 			&& this.isOptionalString(value.message)
 			&& this.isOptionalString(value.hint);
 	}

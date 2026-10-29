@@ -544,4 +544,122 @@ assert.deepEqual(globalThis.__obsidianNotices, [{
 assert.equal(existingNoteErrors.length, 1);
 delete globalThis.__obsidianNotices;
 
+function createFolderRecoveryPlugin() {
+	const plugin = createPlugin();
+	plugin.settings.targetTokenOrUrl = "https://example.feishu.cn/wiki/root";
+	plugin.settings.folderBindings = {};
+	const saves = [];
+	plugin.saveData = async () => {
+		saves.push(structuredClone(plugin.settings.folderBindings));
+	};
+	return { plugin, saves };
+}
+
+const recoveryRoot = { token: "root", kind: "wiki" };
+const healthyFolder = createFolderRecoveryPlugin();
+const healthyKey = healthyFolder.plugin.getFolderBindingKey(recoveryRoot, "Requirement");
+healthyFolder.plugin.settings.folderBindings[healthyKey] = { token: "healthy", containerKind: "wiki" };
+const healthyRequests = [];
+healthyFolder.plugin.runLarkCli = async (args) => {
+	healthyRequests.push(args);
+	return { ok: true, data: { node_token: "healthy" } };
+};
+assert.deepEqual(await healthyFolder.plugin.ensureRemoteFolderPath(recoveryRoot, "Requirement"), {
+	parent: { token: "healthy", kind: "wiki" }, createdBinding: false
+});
+assert.deepEqual(healthyRequests, [["wiki", "+node-get", "--as", "user", "--node-token", "healthy", "--json"]]);
+assert.equal(healthyFolder.saves.length, 0);
+
+const deletedFolder = createFolderRecoveryPlugin();
+const deletedKey = deletedFolder.plugin.getFolderBindingKey(recoveryRoot, "Requirement");
+const otherRootKey = deletedFolder.plugin.getFolderBindingKey({ token: "other-root", kind: "wiki" }, "Requirement");
+deletedFolder.plugin.settings.folderBindings = {
+	[deletedKey]: { token: "deleted", containerKind: "wiki" },
+	[`${deletedKey}/design`]: { token: "deleted-child", containerKind: "wiki" },
+	[`${deletedKey}/unused`]: { token: "deleted-unused", containerKind: "wiki" },
+	[`${deletedKey}-other`]: { token: "sibling", containerKind: "wiki" },
+	[otherRootKey]: { token: "other-root-folder", containerKind: "wiki" }
+};
+const deletedRequests = [];
+deletedFolder.plugin.runLarkCli = async (args) => {
+	deletedRequests.push(args);
+	if (args[1] === "+node-get") {
+		throw Object.assign(new Error("localized deletion message"), { larkCode: 131012 });
+	}
+	const name = args[args.indexOf("--title") + 1];
+	return { ok: true, data: { node_token: `new-${name}`, url: `https://example.feishu.cn/wiki/new-${name}` } };
+};
+assert.deepEqual(await deletedFolder.plugin.ensureRemoteFolderPath(recoveryRoot, "Requirement/design"), {
+	parent: { token: "new-design", kind: "wiki" }, createdBinding: true
+});
+assert.deepEqual(deletedRequests.map((args) => [args[1], args[args.length - 1]]), [
+	["+node-get", "--json"], ["+node-create", "root"], ["+node-create", "new-Requirement"]
+]);
+assert.equal(deletedFolder.plugin.settings.folderBindings[deletedKey].token, "new-Requirement");
+assert.equal(deletedFolder.plugin.settings.folderBindings[`${deletedKey}/design`].token, "new-design");
+assert.equal(deletedFolder.plugin.settings.folderBindings[`${deletedKey}/unused`], undefined);
+assert.equal(deletedFolder.plugin.settings.folderBindings[`${deletedKey}-other`].token, "sibling");
+assert.equal(deletedFolder.plugin.settings.folderBindings[otherRootKey].token, "other-root-folder");
+assert.equal(deletedFolder.saves.length, 3);
+assert.equal(deletedFolder.saves[0][deletedKey], undefined);
+assert.equal(deletedFolder.saves[2][`${deletedKey}/design`].token, "new-design");
+
+for (const failure of [
+	Object.assign(new Error("Permission denied"), { larkCode: 131006 }),
+	Object.assign(new Error("Not found"), { larkCode: 131005 }),
+	new Error("Connection timed out"),
+	new Error("node has been deleted: 131012")
+]) {
+	const blockedFolder = createFolderRecoveryPlugin();
+	blockedFolder.plugin.settings.folderBindings[healthyKey] = { token: "existing", containerKind: "wiki" };
+	const before = structuredClone(blockedFolder.plugin.settings.folderBindings);
+	let requests = 0;
+	blockedFolder.plugin.runLarkCli = async () => { requests += 1; throw failure; };
+	await assert.rejects(blockedFolder.plugin.ensureRemoteFolderPath(recoveryRoot, "Requirement"), (error) => error === failure);
+	assert.equal(requests, 1);
+	assert.deepEqual(blockedFolder.plugin.settings.folderBindings, before);
+	assert.equal(blockedFolder.saves.length, 0);
+}
+
+const failedRebuild = createFolderRecoveryPlugin();
+failedRebuild.plugin.settings.folderBindings[deletedKey] = { token: "deleted", containerKind: "wiki" };
+failedRebuild.plugin.runLarkCli = async (args) => {
+	if (args[1] === "+node-get") {
+		throw Object.assign(new Error("deleted"), { larkCode: 131012 });
+	}
+	throw new Error("Cannot create folder");
+};
+await assert.rejects(failedRebuild.plugin.ensureRemoteFolderPath(recoveryRoot, "Requirement"), /Cannot create folder/);
+assert.equal(failedRebuild.saves.length, 1);
+assert.equal(failedRebuild.saves[0][deletedKey], undefined);
+
+const driveFolder = createFolderRecoveryPlugin();
+const driveRoot = { token: "drive-root", kind: "drive" };
+const driveKey = driveFolder.plugin.getFolderBindingKey(driveRoot, "Requirement");
+driveFolder.plugin.settings.folderBindings[driveKey] = { token: "drive-folder", containerKind: "drive" };
+driveFolder.plugin.runLarkCli = async () => { throw new Error("Drive must not use Wiki checks"); };
+assert.deepEqual(await driveFolder.plugin.ensureRemoteFolderPath(driveRoot, "Requirement"), {
+	parent: { token: "drive-folder", kind: "drive" }, createdBinding: false
+});
+assert.deepEqual(await driveFolder.plugin.ensureRemoteFolderPath(recoveryRoot, ""), {
+	parent: recoveryRoot, createdBinding: false
+});
+
+const commandCodePlugin = createPlugin();
+for (const outputChannel of ["stdout", "stderr"]) {
+	commandCodePlugin.larkCliActiveRequestCount = 0;
+	commandCodePlugin.larkCliRequestQueue = Promise.resolve();
+	commandCodePlugin.waitForLarkCliStartInterval = async () => {};
+	const commandFailure = Object.assign(new Error("Command failed"), {
+		[outputChannel]: JSON.stringify({ ok: false, error: { code: 131012, message: "node has been deleted", hint: "Rediscover node" } })
+	});
+	commandCodePlugin.runLarkCliWithRetry = async () => { throw commandFailure; };
+	await assert.rejects(commandCodePlugin.runLarkCliQueued([], {}), (error) => {
+		assert.equal(error.larkCode, 131012);
+		assert.equal(error.message, "node has been deleted\nRediscover node");
+		return true;
+	});
+	assert.equal(commandCodePlugin.larkCliActiveRequestCount, 0);
+}
+
 console.log("main plugin tests passed");

@@ -1095,6 +1095,24 @@ const tableWithBreakRemoteXml = [
 ].join("");
 const tableWithBreakMarkdown = "# Note\n\n| 字段 | 说明 |\n| --- | --- |\n| biz_no | 规则 trace <br>直销单 trace |";
 assert.equal(await isRemoteXmlContentEquivalent(tableWithBreakRemoteXml, tableWithBreakMarkdown), true);
+const htmlListTableMarkdown = prepareNoteContentForLark(
+	{ basename: "Note" },
+	"| 方案 | 做法 |\n| --- | --- |\n| **推荐** | <ul><li>公共打标</li><li>业务处理</li></ul> |",
+	"file-name"
+);
+const htmlListTableRemoteXml = '<title id="doc-token">Note</title><table id="table-list"><tr><th>方案</th><th>做法</th></tr><tr><td><b>推荐</b></td><td><p>• 公共打标<br/>• 业务处理</p></td></tr></table>';
+assert.equal(await isRemoteXmlContentEquivalent(htmlListTableRemoteXml, htmlListTableMarkdown), true);
+const htmlListTableState = await createDocumentSyncStateFromRemote(
+	"doc-token", htmlListTableMarkdown, htmlListTableRemoteXml, 9
+);
+const htmlListTablePlan = await buildSyncPlan({
+	doc: "doc-token",
+	markdown: htmlListTableMarkdown,
+	contentFileName: "table.md",
+	strategy: "auto",
+	state: htmlListTableState
+});
+assert.equal(htmlListTablePlan.mode, "skipped");
 const tableWithBreakSignature = await createSyncContentSignature(tableWithBreakMarkdown);
 const tableWithBreakState = await createDocumentSyncStateFromRemote(
 	"doc-token",

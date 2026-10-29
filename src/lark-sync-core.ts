@@ -219,7 +219,48 @@ const DOCUMENT_END_BLOCK_ID = "-1";
 
 export function prepareNoteContentForLark(file: NoteFile, content: string, titleSource: TitleSource): string {
 	const title = extractTitle(file, content, titleSource);
-	return prependMarkdownTitle(content, title);
+	const preparedContent = normalizeMarkdownTableHtmlLists(content);
+	return prependMarkdownTitle(preparedContent, title);
+}
+
+function normalizeMarkdownTableHtmlLists(content: string): string {
+	const lines = content.split("\n");
+	let fence = "";
+	let inTable = false;
+	return lines.map((line, index) => {
+		const fenceMatch = line.match(/^ {0,3}(`{3,}|~{3,})/);
+		const fenceMarker = fenceMatch?.[1] || "";
+		if (fence) {
+			if (fenceMatch && fenceMarker[0] === fence[0]
+				&& fenceMarker.length >= fence.length
+				&& line.slice(fenceMatch[0].length).trim() === "") {
+				fence = "";
+			}
+			return line;
+		}
+		if (fenceMatch) {
+			fence = fenceMarker;
+			inTable = false;
+			return line;
+		}
+		inTable = (inTable && isMarkdownTableBlockLine(line)) || isMarkdownTableStart(lines, index);
+		if (!inTable || /^\s{4}|^\t/.test(line)) {
+			return line;
+		}
+
+		// lark-cli drops block HTML inside table cells; keep inline code literal.
+		return line.replace(/(`+)(?!`).*?\1(?!`)|(?<!\\)<ul>\s*((?:<li>.*?<\/li>\s*)+)<\/ul>/gi,
+			(match, codeFence: string | undefined, items: string | undefined) => {
+				if (codeFence || !items) {
+					return match;
+				}
+				const entries = [...items.matchAll(/<li>(.*?)<\/li>/gi)];
+				if (entries.some((entry) => /<\/?(?:ul|ol|li)\b/i.test(entry[1] || ""))) {
+					return match;
+				}
+				return entries.map((entry) => `• ${(entry[1] || "").trim()}`).join("<br>");
+			});
+	}).join("\n");
 }
 
 export function extractTitle(file: NoteFile, content: string, titleSource: TitleSource): string {
